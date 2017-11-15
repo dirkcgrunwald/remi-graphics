@@ -18,7 +18,7 @@ class MyApp(App):
         self.lbl.set_text('click!')
 
     def main(self, name='world'):
-        self.root = gui.Widget(width=600, height=600, margin='0px auto')
+        self.root = gui.Widget(width=600, height=600, margin='50px 50px')
         self.root.style['position']='absolute'
 
         self.svg = gui.Svg(self.root.style['width'], self.root.style['height'])

@@ -3,6 +3,8 @@ import math
 import threading
 import random
 import signal
+import time
+import logging
 
 class GraphicsError(Exception):
     """Generic error class for graphics module exceptions."""
@@ -40,6 +42,7 @@ class Transform:
         return x,y
 
 
+cv_glbl_graph_win = threading.Condition()
 glbl_remi_root = None
 glbl_graph_win = None
 
@@ -56,8 +59,7 @@ class GraphWinRemi(remi.App):
         self.height = glbl_graph_win.height
 
         self._root = remi.gui.Widget(width=self.width,
-                               height=self.height,
-                               margin='50px 50px')
+                               height=self.height)
         self._root.style['position']='absolute'
 
         self.svg = remi.gui.Svg(self._root.style['width'],
@@ -69,29 +71,36 @@ class GraphWinRemi(remi.App):
 
         self.widg = remi.gui.Widget(width=self._root.style['width'],
                                height=self._root.style['height'])
+        self.widg.style['background-color'] = 'transparent'
         self.widg.style['position'] = 'absolute'
         self.widg.style['top'] = '0px'
         self.widg.style['left'] = '0px'
-#        self._root.append(self.widg)
+        self._root.append(self.widg)
         
+        cv_glbl_graph_win.acquire()
+        cv_glbl_graph_win.notify()
+        cv_glbl_graph_win.release()
+
         return self._root
 
 
-class GraphWin(remi.App):
+class GraphWin:
     def __init__(self, title="Graphics Window", width=600, height=600, *args):
 
         global glbl_graph_win
+        global cv_glbl_graph_win
+
         glbl_graph_win = self
 
         self.foreground = "black"
-        self.items = []
         self.mouseX = None
         self.mouseY = None
         self.height=height
         self.width=width
-        self.closed=False
+        self.closed=True
         self.trans = None
         self.autoflush = True
+        self._mouseCallback = None
 
         self.remi = None
 
@@ -99,11 +108,19 @@ class GraphWin(remi.App):
                                     target=remi.start,
                                     args=(GraphWinRemi,),
                                     kwargs={'title':title,
-                                            'address':'0.0.0.0'})
+                                            'address':'0.0.0.0',
+                                            'logging':logging.CRITICAL,
+                                            })
         self.thd.setDaemon(True)
         self.thd.start()
+        
+        cv_glbl_graph_win.acquire()
+        while self.isClosed():
+            cv_glbl_graph_win.wait()
+        cv_glbl_graph_win.release()
 
     def update():
+        """Updates are done by the SVG objects, not the window.."""
         pass
 
     def __checkOpen(self):
@@ -114,9 +131,6 @@ class GraphWin(remi.App):
             self.closed = False
             self.remi = glbl_remi_root
 
-        if self.closed:
-            raise GraphicsError("window is closed")
-
     def setBackground(self, color):
         pass
 
@@ -126,9 +140,13 @@ class GraphWin(remi.App):
         self.trans = Transform(self.width, self.height, x1, y1, x2, y2)
 
     def close(self):
+        global glbl_graph_win
         if self.closed: return
         if self.thd.is_alive():
-            signal.pthread_kill(self.thd.get_ident(), signal.SIGKILL)
+#            if glbl_graph_win:
+#                glbl_graph_win.close()
+            glbl_graph_win = None
+            signal.pthread_kill(self.thd.ident, signal.SIGKILL)
         self.closed=True
 
     def isClosed(self):
@@ -166,6 +184,45 @@ class GraphWin(remi.App):
         self.__checkOpen()
         pass
 
+    def setMouseHandler(self, func):
+        self._mouseCallback = func
+        
+    def _onClickHandler(self, widget, x, y):
+        self.mouseX = int(x)
+        self.mouseY = int(y)
+        if self._mouseCallback:
+            self._mouseCallback(Point(x,y))
+
+    def getMouse(self):
+        """Wait for mouse click and return Point object representing
+        the click"""
+        if self.isClosed():
+            raise GraphicsError("getMouse in closed window")
+            
+        self.remi.widg.set_on_mouseup_listener(self._onClickHandler)
+        self.mouseX = None
+        self.mouseY = None
+        while self.mouseX == None or self.mouseY == None:
+            if self.isClosed(): raise GraphicsError("getMouse in closed window")
+            time.sleep(.05) # give up thread
+        x,y = self.toWorld(self.mouseX, self.mouseY)
+        self.mouseX = None
+        self.mouseY = None
+        return Point(x,y)
+
+    def checkMouse(self):
+        """Return last mouse click or None if mouse has
+        not been clicked since last call"""
+        if self.isClosed():
+            raise GraphicsError("checkMouse in closed window")
+        if self.mouseX != None and self.mouseY != None:
+            x,y = self.toWorld(self.mouseX, self.mouseY)
+            self.mouseX = None
+            self.mouseY = None
+            return Point(x,y)
+        else:
+            return None
+
     def getHeight(self):
         """Return the height of the window"""
         return self.height
@@ -187,18 +244,19 @@ class GraphWin(remi.App):
             return self.trans.world(x,y)
         else:
             return x,y
-    
 
 # Default values for various item configuration options. Only a subset of
 #   keys may be present in the configuration dictionary for a given item
 DEFAULT_CONFIG = {
       "fill":"",
+      "color":"",
+      "stroke-width" : 1,
       "outline":"black",
-      "width":"1",
       "arrow":"none",
       "text":"",
-      "justify":"center",
-      "font": ("helvetica", 12, "normal")
+      "text-anchor":"middle",
+      "font": ("helvetica", 12, "normal"),
+      "background-color" : "white"
 }
 
 class GraphicsObject:
@@ -233,7 +291,7 @@ class GraphicsObject:
         
     def setWidth(self, width):
         """Set line weight to width"""
-        self._reconfig("width", width)
+        self._reconfig("stroke-width", width)
 
     def draw(self, graphwin):
 
@@ -245,40 +303,35 @@ class GraphicsObject:
         if self.canvas and not self.canvas.isClosed(): raise GraphicsError(OBJ_ALREADY_DRAWN)
         if graphwin.isClosed(): raise GraphicsError("Can't draw to closed window")
         self.canvas = graphwin
-        self.id = self._draw(graphwin, self.config)
-        print('graphwin.remi is', type(graphwin.remi))
-        self.key = graphwin.remi.svg.append(self.id)
+        if self.id:
+            self.id.set_enabled(True)
+        else:
+            self.id = self._draw(graphwin, self.config)
+            self.key = graphwin.remi.svg.append(self.id)
             
     def undraw(self):
 
         """Undraw the object (i.e. hide it). Returns silently if the
         object is not currently drawn."""
         
-        if not self.canvas: return
-        if not self.canvas.isClosed():
-            self.canvas.remi.svg.remove_child(self.id)
-        self.canvas = None
-        self.id = None
+        if self.id:
+            self.id.set_enabled(False)
 
+    def update(self):
+        if self.id:
+            self.id.redraw()
 
     def move(self, dx, dy):
 
         """move object dx units in x direction and dy units in y
         direction"""
-        
-        self._move(dx,dy)
+
         canvas = self.canvas
-        if canvas and not canvas.isClosed():
-            trans = canvas.trans
-            if trans:
-                x = dx/ trans.xscale 
-                y = -dy / trans.yscale
-            else:
-                x = dx
-                y = dy
-            self.canvas.move(self.id, x, y)
-            if canvas.autoflush:
-                _root.update()
+        if canvas:
+            self.undraw()
+        self._move(dx,dy)
+        if canvas:
+            self.draw(canvas)
            
     def _reconfig(self, option, setting):
         # Internal method for changing configuration of the object
@@ -288,11 +341,14 @@ class GraphicsObject:
             raise GraphicsError(UNSUPPORTED_METHOD)
         options = self.config
         options[option] = setting
-        if self.canvas and not self.canvas.isClosed():
-            self.canvas.itemconfig(self.id, options)
-            if self.canvas.autoflush:
-                _root.update()
 
+        if self.id:
+            if option == 'outline':
+                self.id.attributes['stroke'] = setting
+            else:
+                self.id.attributes[option]=setting
+            canvas = self.canvas
+            self.update()
 
     def _draw(self, canvas, options):
         """draws appropriate figure on canvas with options provided
@@ -311,10 +367,13 @@ class Point(GraphicsObject):
         self.setFill = self.setOutline
         self.x = x
         self.y = y
+
+    def __str__(self):
+        return '(' + str(self.x) + ', ' + str(self.y) + ')'
         
     def _draw(self, canvas, options):
         x,y = canvas.toScreen(self.x,self.y)
-        pt = remi.gui.SvgRectangle(x,y,x+1,y+1)
+        pt = remi.gui.SvgRectangle(int(x), int(y), int(x+1), int(y+1))
         pt.attributes['stroke'] = options['outline']
         return pt
         
@@ -334,10 +393,13 @@ class _BBox(GraphicsObject):
     # Internal base class for objects represented by bounding box
     # (opposite corners) Line segment is a degenerate case.
     
-    def __init__(self, p1, p2, options=["outline","width","fill"]):
+    def __init__(self, p1, p2, options=["outline","fill", "stroke-width"]):
         GraphicsObject.__init__(self, options)
         self.p1 = p1.clone()
         self.p2 = p2.clone()
+
+    def __str__(self):
+        return 'Bbox(' + str(self.p1) + ', ' + str(self.p2) + ')'
 
     def _move(self, dx, dy):
         self.p1.x = self.p1.x + dx
@@ -359,14 +421,21 @@ class Rectangle(_BBox):
     def __init__(self, p1, p2):
         _BBox.__init__(self, p1, p2)
     
+    def __str__(self):
+        return 'Rect(' + str(self.p1) + ', ' + str(self.p2) + ')'
+
     def _draw(self, canvas, options):
         p1 = self.p1
         p2 = self.p2
         x1,y1 = canvas.toScreen(p1.x,p1.y)
         x2,y2 = canvas.toScreen(p2.x,p2.y)
-        pt = remi.gui.SvgRectangle(x1,y1,x2,y2)
+        minx, maxx = min(x1,x2), max(x1,x2)
+        miny, maxy = min(y1,y2), max(y1,y2)
+        w = maxx-minx
+        h = maxy-miny
+        pt = remi.gui.SvgRectangle(minx, miny, w, h)
         pt.attributes['stroke'] = options['outline']
-        if options['fill'] != "":
+        if len(options['fill']) > 0:
             pt.attributes['fill'] = options['fill']
         return pt
         
@@ -398,7 +467,7 @@ class Oval(_BBox):
         ry = h//2
         cx = mx + rx
         cy = my + ry
-        pt = remi.gui.SvgEllipse(cx,cy,rx,ry)
+        pt = remi.gui.SvgEllipse(int(cx), int(cy), int(rx), int(ry))
         pt.attributes['stroke'] = options['outline']
         if len(self.config['fill']) > 0: 
             pt.style['color'] = self.config['fill']
@@ -436,7 +505,7 @@ class Line(_BBox):
         p2 = self.p2
         x1,y1 = canvas.toScreen(p1.x,p1.y)
         x2,y2 = canvas.toScreen(p2.x,p2.y)
-        line = remi.gui.SvgLine(x1,y1,x2,y2)
+        line = remi.gui.SvgLine(int(x1), int(y1), int(x2), int(y2))
         if len(self.config['fill']) > 0: 
             line.style['color'] = self.config['fill']
         return line
@@ -445,6 +514,68 @@ class Line(_BBox):
         if not option in ["first","last","both","none"]:
             raise GraphicsError(BAD_OPTION)
         self._reconfig("arrow", option)
+
+class Text(_BBox):
+    
+    def __init__(self, p1, text):
+        GraphicsObject.__init__(self, ["text-anchor",'color',
+                                       "fill","text", "font",
+                                       'background-color'])
+        self.p1 = p1
+        self.setFill(DEFAULT_CONFIG['outline'])
+        self.text = text
+        self.setOutline = self.setFill
+   
+    def clone(self):
+        other = Text(self.p1, self.text)
+        other.config = self.config.copy()
+        return other
+  
+    def _draw(self, canvas, options):
+        p1 = self.p1
+        x1,y1 = canvas.toScreen(p1.x,p1.y)
+        line = remi.gui.SvgText(int(x1), int(y1), self.text)
+        line.attributes['text-anchor'] = 'middle'
+        if len(self.config['fill']) > 0: 
+            line.style['color'] = self.config['fill']
+        return line
+
+    def setText(self,text):
+        self.text = text
+        if self.id:
+            self.id.set_text(self.text)
+        
+    def getText(self):
+        return self.text
+            
+    def getAnchor(self):
+        return self.anchor.clone()
+
+    def setFace(self, face):
+        if face in ['helvetica','arial','courier','times roman']:
+            f,s,b = self.config['font']
+            self._reconfig("font",(face,s,b))
+        else:
+            raise GraphicsError(BAD_OPTION)
+
+    def setSize(self, size):
+        if 5 <= size <= 36:
+            f,s,b = self.config['font']
+            self._reconfig("font", (f,size,b))
+        else:
+            raise GraphicsError(BAD_OPTION)
+
+    def setStyle(self, style):
+        if style in ['bold','normal','italic', 'bold italic']:
+            f,s,b = self.config['font']
+            self._reconfig("font", (f,s,style))
+        else:
+            raise GraphicsError(BAD_OPTION)
+
+    def setTextColor(self, color):
+        self.setFill(color)
+
+
         
 
 class Polygon(GraphicsObject):
@@ -474,47 +605,99 @@ class Polygon(GraphicsObject):
 
         for p in self.points:
             x,y = canvas.toScreen(p.x,p.y)
-            pl.add_coord(x,y)
+            pl.add_coord(int(x), int(y))
             
         if len(self.config['fill']) > 0: 
             pl.style['color'] = self.config['fill']
 
         return pl
 
-class Text(GraphicsObject):
+class TextBox(GraphicsObject):
     
-    def __init__(self, p, text):
-        GraphicsObject.__init__(self, ["justify","fill","text","font"])
+    def __init__(self, p, text, width=0):
+        GraphicsObject.__init__(self, ["text-anchor",'color',
+                                       "fill","text", "font",
+                                       'background-color'])
         self.setText(text)
+        self.width=width
         self.anchor = p.clone()
         self.setFill(DEFAULT_CONFIG['outline'])
+        self.config['text-anchor']='middle'
+        self.config['background-color'] = 'transparent'
         self.setOutline = self.setFill
         
+    def draw(self, graphwin):
+
+        """Draw the object in graphwin, which should be a GraphWin
+        object.  A GraphicsObject may only be drawn into one
+        window. Raises an error if attempt made to draw an object that
+        is already visible."""
+
+        if self.canvas and not self.canvas.isClosed(): raise GraphicsError(OBJ_ALREADY_DRAWN)
+        if graphwin.isClosed(): raise GraphicsError("Can't draw to closed window")
+        self.canvas = graphwin
+        if self.id:
+            self.id.set_enabled(True)
+        else:
+            self.id = self._draw(graphwin, self.config)
+            self.key = graphwin.remi.widg.append(self.id)
+            
+    def undraw(self):
+
+        """Undraw the object (i.e. hide it). Returns silently if the
+        object is not currently drawn."""
+        
+        if self.id:
+            self.id.set_enabled(False)
+
     def _draw(self, canvas, options):
         p = self.anchor
         x,y = canvas.toScreen(p.x,p.y)
-        txt = remi.gui.SvgText(x,y,self.config['text'])
+        txt = remi.gui.Label(self.text)
         if len(self.config['fill']) > 0: 
             txt.style['color'] = self.config['fill']
         f,s,b=self.config['font']
         txt.style['font-family'] = f
-        txt.style['font-wright'] = b
-        txt.style['text-anchor'] = self.config['justify']
+        txt.style['font-weight'] = b
+        txt.style['text-align'] = 'center'
+        txt.style['background-color'] = 'transparent'
+        txt.style['position'] = 'absolute'
+        txt.style['top'] = str(int(y)) + "px"
+        txt.style['left'] = str(int(x)) + "px"
+
         return txt
         
+    def _reconfig(self, option, setting):
+        # Internal method for changing configuration of the object
+        # Raises an error if the option does not exist in the config
+        #    dictionary for this object
+        if option not in self.config:
+            raise GraphicsError(UNSUPPORTED_METHOD)
+        options = self.config
+        options[option] = setting
+
+        if self.id:
+            if option == 'outline':
+                self.id.style['stroke'] = setting
+            else:
+                self.id.style[option]=setting
+            self.id.redraw()
+
     def _move(self, dx, dy):
         self.anchor.move(dx,dy)
         
     def clone(self):
-        other = Text(self.anchor, self.config['text'])
+        other = Text(self.anchor, self.text)
         other.config = self.config.copy()
         return other
 
     def setText(self,text):
-        self._reconfig("text", text)
+        self.text = text
+        if self.id:
+            self.id.set_text(self.text)
         
     def getText(self):
-        return self.config["text"]
+        return self.text
             
     def getAnchor(self):
         return self.anchor.clone()
@@ -543,92 +726,33 @@ class Text(GraphicsObject):
     def setTextColor(self, color):
         self.setFill(color)
 
-class Entry(GraphicsObject):
+class Entry(Text):
 
     def __init__(self, p, width):
-        GraphicsObject.__init__(self, [])
-        self.anchor = p.clone()
-        #print self.anchor
+        Text.__init__(self, p, "")
         self.width = width
-        self.text = tk.StringVar(_root)
-        self.text.set("")
-        self.fill = "gray"
-        self.color = "black"
+        self.text = ""
+        self.config['background-color'] = 'lightgray'
         self.font = DEFAULT_CONFIG['font']
-        self.entry = None
+
+
+    def _ontextchange(self, widget, text):
+        self.text = widget.get_text()
 
     def _draw(self, canvas, options):
         p = self.anchor
         x,y = canvas.toScreen(p.x,p.y)
         frm = remi.gui.TextInput(width=self.width)
-        frm.txt.set_text(self.txt)
+        self.setText(self.text)
         frm.style['position'] = 'absolute'
-        frm.style['top'] = "%dpx" % x
-        frm.style['left'] = "%dpx" % y
+        frm.style['top'] = str(int(y)) + "px"
+        frm.style['left'] = str(int(x)) + "px"
+        frm.set_on_change_listener(self._ontextchange)
 
-        if len(self.config['fill']) > 0: 
-            frm.style['color'] = self.config['fill']
+        if len(self.config['color']) > 0: 
+            frm.style['color'] = self.config['color']
 
         return frm
-
-    def getText(self):
-        return self.text.get()
-
-    def _move(self, dx, dy):
-        self.anchor.move(dx,dy)
-
-    def getAnchor(self):
-        return self.anchor.clone()
-
-    def clone(self):
-        other = Entry(self.anchor, self.width)
-        other.config = self.config.copy()
-        other.text = tk.StringVar()
-        other.text.set(self.text.get())
-        other.fill = self.fill
-        return other
-
-    def setText(self, t):
-        self.text.set(t)
-
-            
-    def setFill(self, color):
-        self.fill = color
-        if self.entry:
-            self.entry.config(bg=color)
-
-            
-    def _setFontComponent(self, which, value):
-        font = list(self.font)
-        font[which] = value
-        self.font = tuple(font)
-        if self.entry:
-            self.entry.config(font=self.font)
-
-
-    def setFace(self, face):
-        if face in ['helvetica','arial','courier','times roman']:
-            self._setFontComponent(0, face)
-        else:
-            raise GraphicsError(BAD_OPTION)
-
-    def setSize(self, size):
-        if 5 <= size <= 36:
-            self._setFontComponent(1,size)
-        else:
-            raise GraphicsError(BAD_OPTION)
-
-    def setStyle(self, style):
-        if style in ['bold','normal','italic', 'bold italic']:
-            self._setFontComponent(2,style)
-        else:
-            raise GraphicsError(BAD_OPTION)
-
-    def setTextColor(self, color):
-        self.color=color
-        if self.entry:
-            self.entry.config(fg=color)
-
 
 def main():
     win = GraphWin("My Circle", 100, 100)
